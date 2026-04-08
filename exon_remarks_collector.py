@@ -1,22 +1,17 @@
+import argparse
 import asyncio
 import csv
+import os
 import re
 import sqlite3
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
-
-DB_PATH = Path("exon_remarks.db")
-CSV_PATH = Path("exon_remarks_export.csv")
-START_URL = "https://exon.exonproject.ru/"
-HEADLESS = False
-SCROLL_STEP_RATIO = 0.85
-SCROLL_PAUSE_MS = 1200
-MAX_STAGNANT_SCROLLS = 4
 
 STATUS_VALUES = {
     "Нет замечаний",
@@ -67,11 +62,103 @@ CATEGORY_RULES = [
 ]
 
 
+@dataclass
+class AppConfig:
+    db_path: Path
+    csv_path: Path
+    start_url: str
+    headless: bool
+    scroll_pause_ms: int
+    scroll_step_ratio: float
+    max_stagnant_scrolls: int
+    limit: int | None
+    export_csv: bool
+
+
 def configure_output() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Сбор данных по актам Exon через Playwright."
+    )
+    parser.add_argument(
+        "--db-path",
+        default=os.getenv("EXON_DB_PATH", "exon_remarks.db"),
+        help="Путь к SQLite-базе.",
+    )
+    parser.add_argument(
+        "--csv-path",
+        default=os.getenv("EXON_CSV_PATH", "exon_remarks_export.csv"),
+        help="Путь к CSV-экспорту.",
+    )
+    parser.add_argument(
+        "--start-url",
+        default=os.getenv("EXON_START_URL", "https://exon.exonproject.ru/"),
+        help="Стартовый URL Exon.",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=env_bool("EXON_HEADLESS", False),
+        help="Запускать браузер без окна.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=int(os.getenv("EXON_LIMIT", "0")) or None,
+        help="Ограничение на количество актов. По умолчанию без лимита.",
+    )
+    parser.add_argument(
+        "--scroll-pause-ms",
+        type=int,
+        default=int(os.getenv("EXON_SCROLL_PAUSE_MS", "1200")),
+        help="Пауза после прокрутки списка в миллисекундах.",
+    )
+    parser.add_argument(
+        "--scroll-step-ratio",
+        type=float,
+        default=float(os.getenv("EXON_SCROLL_STEP_RATIO", "0.85")),
+        help="Доля высоты видимой области для одного шага прокрутки.",
+    )
+    parser.add_argument(
+        "--max-stagnant-scrolls",
+        type=int,
+        default=int(os.getenv("EXON_MAX_STAGNANT_SCROLLS", "4")),
+        help="Сколько раз подряд можно не получить новых строк перед остановкой.",
+    )
+    parser.add_argument(
+        "--no-export-csv",
+        action="store_true",
+        help="Не формировать CSV после сбора.",
+    )
+    return parser
+
+
+def get_config() -> AppConfig:
+    args = build_parser().parse_args()
+    return AppConfig(
+        db_path=Path(args.db_path),
+        csv_path=Path(args.csv_path),
+        start_url=args.start_url,
+        headless=args.headless,
+        scroll_pause_ms=args.scroll_pause_ms,
+        scroll_step_ratio=args.scroll_step_ratio,
+        max_stagnant_scrolls=args.max_stagnant_scrolls,
+        limit=args.limit,
+        export_csv=not args.no_export_csv,
+    )
 
 
 def classify(text: str) -> str:
@@ -82,8 +169,8 @@ def classify(text: str) -> str:
     return "прочее"
 
 
-def ensure_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
+def ensure_db(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute(
         """
@@ -214,7 +301,7 @@ async def get_virtual_scroller(page):
     return None, None
 
 
-async def get_row_snapshot(row) -> dict[str, str] | None:
+async def get_row_snapshot(row, start_url: str) -> dict[str, str] | None:
     row_text = (await row.inner_text()).strip()
     if not row_text:
         return None
@@ -227,17 +314,9 @@ async def get_row_snapshot(row) -> dict[str, str] | None:
             if href:
                 break
 
-    href = urljoin(START_URL, href) if href else ""
+    href = urljoin(start_url, href) if href else ""
     act_id = extract_act_id(href)
     row_index = await row.get_attribute("data-rowindex") or ""
-
-    if not act_id and not href:
-        return {
-            "row_index": row_index,
-            "href": "",
-            "act_id": "",
-            "row_text": row_text,
-        }
 
     return {
         "row_index": row_index,
@@ -247,7 +326,7 @@ async def get_row_snapshot(row) -> dict[str, str] | None:
     }
 
 
-def choose_remark(lines: list[str], fallback_status: str) -> str:
+def choose_remark(lines: list[str]) -> str:
     if not lines:
         return ""
 
@@ -270,10 +349,7 @@ def choose_remark(lines: list[str], fallback_status: str) -> str:
             continue
         candidates.append(line)
 
-    if not candidates:
-        return "" if fallback_status == "Нет замечаний" else ""
-
-    return max(candidates, key=len)
+    return max(candidates, key=len, default="")
 
 
 async def extract_detail_payload(page, row_meta: dict[str, str]) -> dict[str, str]:
@@ -316,7 +392,7 @@ async def extract_detail_payload(page, row_meta: dict[str, str]) -> dict[str, st
             "",
         )
 
-    remark = choose_remark(texts + body_lines, status)
+    remark = choose_remark(texts + body_lines)
     return {
         "status": status,
         "remark": remark,
@@ -325,8 +401,13 @@ async def extract_detail_payload(page, row_meta: dict[str, str]) -> dict[str, st
     }
 
 
-def upsert_record(snapshot: dict[str, str], row_meta: dict[str, str], detail: dict[str, str]) -> None:
-    conn = sqlite3.connect(DB_PATH)
+def upsert_record(
+    db_path: Path,
+    snapshot: dict[str, str],
+    row_meta: dict[str, str],
+    detail: dict[str, str],
+) -> None:
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     collected_at = datetime.now().isoformat(timespec="seconds")
     act_label = " | ".join(
@@ -390,8 +471,8 @@ def upsert_record(snapshot: dict[str, str], row_meta: dict[str, str], detail: di
     conn.close()
 
 
-def export_csv() -> None:
-    conn = sqlite3.connect(DB_PATH)
+def export_csv(db_path: Path, csv_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     rows = cur.execute(
@@ -419,11 +500,13 @@ def export_csv() -> None:
         """
     ).fetchall()
 
-    with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=rows[0].keys() if rows else [])
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
         if rows:
+            writer = csv.DictWriter(csv_file, fieldnames=rows[0].keys())
             writer.writeheader()
             writer.writerows(dict(row) for row in rows)
+        else:
+            csv_file.write("")
 
     conn.close()
 
@@ -436,15 +519,23 @@ async def open_act_page(context, href: str):
     return page
 
 
-async def process_visible_rows(page, selector_used: str, seen_ids: set[str]) -> int:
+async def process_visible_rows(
+    page,
+    config: AppConfig,
+    selector_used: str,
+    seen_ids: set[str],
+) -> int:
     rows = page.locator(selector_used)
     visible_count = await rows.count()
     processed_now = 0
 
     for index in range(visible_count):
+        if config.limit is not None and len(seen_ids) >= config.limit:
+            break
+
         row = rows.nth(index)
         try:
-            snapshot = await get_row_snapshot(row)
+            snapshot = await get_row_snapshot(row, config.start_url)
         except Exception as exc:
             print(f"Не удалось прочитать строку {index + 1}: {exc}")
             continue
@@ -472,7 +563,7 @@ async def process_visible_rows(page, selector_used: str, seen_ids: set[str]) -> 
         try:
             act_page = await open_act_page(page.context, snapshot["href"])
             detail = await extract_detail_payload(act_page, row_meta)
-            upsert_record(snapshot, row_meta, detail)
+            upsert_record(config.db_path, snapshot, row_meta, detail)
             print(
                 f"  -> {detail['status'] or 'без статуса'} | "
                 f"{detail['category']} | "
@@ -489,7 +580,7 @@ async def process_visible_rows(page, selector_used: str, seen_ids: set[str]) -> 
     return processed_now
 
 
-async def scroll_next_chunk(scroller) -> tuple[bool, int, int]:
+async def scroll_next_chunk(page, scroller, config: AppConfig) -> tuple[bool, int, int]:
     metrics_before = await scroller.evaluate(
         """node => ({
             top: Math.round(node.scrollTop),
@@ -497,9 +588,9 @@ async def scroll_next_chunk(scroller) -> tuple[bool, int, int]:
             client: Math.round(node.clientHeight)
         })"""
     )
-    step = max(int(metrics_before["client"] * SCROLL_STEP_RATIO), 300)
+    step = max(int(metrics_before["client"] * config.scroll_step_ratio), 300)
     await scroller.evaluate("(node, delta) => { node.scrollTop = node.scrollTop + delta; }", step)
-    await scroller.page.wait_for_timeout(SCROLL_PAUSE_MS)
+    await page.wait_for_timeout(config.scroll_pause_ms)
     metrics_after = await scroller.evaluate(
         """node => ({
             top: Math.round(node.scrollTop),
@@ -508,11 +599,10 @@ async def scroll_next_chunk(scroller) -> tuple[bool, int, int]:
         })"""
     )
     moved = metrics_after["top"] > metrics_before["top"]
-    reached_end = metrics_after["top"] + metrics_after["client"] >= metrics_after["height"] - 5
     return moved, metrics_after["top"], metrics_after["height"]
 
 
-async def process_list(page) -> None:
+async def process_list(page, config: AppConfig) -> None:
     rows, selector_used = await get_rows_locator(page)
     if not rows or not selector_used:
         print("Строки не найдены. Проверь, что открыт именно список актов.")
@@ -533,13 +623,15 @@ async def process_list(page) -> None:
 
     while True:
         processed_before = len(seen_ids)
-        processed_total += await process_visible_rows(page, selector_used, seen_ids)
+        processed_total += await process_visible_rows(page, config, selector_used, seen_ids)
         new_items = len(seen_ids) - processed_before
 
+        if config.limit is not None and len(seen_ids) >= config.limit:
+            break
         if not scroller:
             break
 
-        moved, top, height = await scroll_next_chunk(scroller)
+        moved, top, height = await scroll_next_chunk(page, scroller, config)
         print(f"Прокрутка списка: top={top}, height={height}, новых элементов={new_items}")
 
         if new_items == 0:
@@ -547,7 +639,7 @@ async def process_list(page) -> None:
         else:
             stagnant_scrolls = 0
 
-        if not moved or stagnant_scrolls >= MAX_STAGNANT_SCROLLS:
+        if not moved or stagnant_scrolls >= config.max_stagnant_scrolls:
             break
 
     print(f"Обработано актов: {processed_total}")
@@ -555,14 +647,15 @@ async def process_list(page) -> None:
 
 async def main() -> None:
     configure_output()
-    ensure_db()
+    config = get_config()
+    ensure_db(config.db_path)
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=HEADLESS)
+        browser = await playwright.chromium.launch(headless=config.headless)
         context = await browser.new_context()
         page = await context.new_page()
 
-        await page.goto(START_URL)
+        await page.goto(config.start_url)
         await wait_login(page)
 
         print("Открой список актов по адресу /itd/registry/work-sections и дождись полной загрузки, затем Enter")
@@ -577,9 +670,11 @@ async def main() -> None:
             return
 
         print(f"Текущий URL: {page.url}")
-        await process_list(page)
-        export_csv()
-        print(f"Экспорт сохранён: {CSV_PATH.resolve()}")
+        await process_list(page, config)
+
+        if config.export_csv:
+            export_csv(config.db_path, config.csv_path)
+            print(f"Экспорт сохранён: {config.csv_path.resolve()}")
 
         print("Готово. Нажми Enter для закрытия браузера")
         input()
